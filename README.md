@@ -4,6 +4,10 @@ A GitHub Actions schedule that runs the daily data pipeline of [ilmi](https://il
 
 The repository is public because GitHub does not bill standard runners for a public repository. It holds only the workflow in `.github/workflows/daily.yml` and this file: no data and no secret value. The code it runs is checked out from a private repository with a read and write deploy key, and the secrets are repository secrets.
 
+## What starts it
+
+GitHub's scheduler never started a run in this repository, so `.github/workflows/tick.yml` keeps the time: it runs about 5.5 hours, starts `deploy.yml` every 15 minutes and `daily.yml` at 02:23 and 08:23 UTC, and at its end starts the next ticker. Only the built-in workflow token is used. Stop it with `gh workflow disable tick.yml`.
+
 ## What a run does
 
 1. At 02:23 and again at 08:23 UTC it checks whether the live site already serves today's data. If it does, it stops. The second time exists because GitHub delays and sometimes drops scheduled runs.

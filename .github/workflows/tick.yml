@@ -1,0 +1,58 @@
+name: ilmi ticker
+
+# The clock of this repository. GitHub's scheduler never started a run here (0 scheduled runs on 2026-11-09, although daily.yml and
+# deploy.yml declare crons and the private ilmi repository's crons did fire), so this job keeps the time instead: it lives about
+# 5.5 hours, starts deploy.yml every 15 minutes and daily.yml once per 02:23 and 08:23 UTC slot (the slot it starts in too, so a late
+# ticker catches up; daily.yml stops by itself when the live site already serves today's data), and at its end, failed or not, it
+# starts the next ticker. The built-in GITHUB_TOKEN may do that: GitHub's docs say "workflow_dispatch and repository_dispatch events
+# always create workflow runs" when that token sends them. So no token of a person is stored anywhere.
+# Two tickers never run at once (one concurrency group, a newer pending run replaces an older one). The cron below restarts the
+# chain if it ever breaks and GitHub's scheduler works by then. Stop it for good: gh workflow disable tick.yml -R <this repository>.
+
+on:
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long this ticker lives before it starts the next one (330 normally; a test uses a few)."
+        type: number
+        default: 330
+
+concurrency:
+  group: ilmi-ticker
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    permissions:
+      actions: write   # start deploy.yml, daily.yml and the next tick.yml of THIS repository
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LIVE_MINUTES: ${{ inputs.minutes || 330 }}
+    steps:
+      - name: Start the deploy check every 15 minutes and the daily run once per 02:23 and 08:23 UTC slot
+        run: |
+          set -u
+          m=${LIVE_MINUTES%.*}; [ "$m" -ge 1 ] 2>/dev/null || m=330; [ "$m" -le 330 ] || m=330
+          end=$(( $(date +%s) + m * 60 ))
+          last_deploy="" last_daily=""
+          start() { if gh workflow run "$1" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then echo "$(date -u +%H:%M) started $1"; else echo "$(date -u +%H:%M) could not start $1"; fi; }
+          while [ "$(date +%s)" -lt "$end" ]; do
+            now=$(date +%s); hm=$(date -u +%H%M)
+            q=$(( now / 900 ))
+            if [ "$q" != "$last_deploy" ]; then start deploy.yml; last_deploy=$q; fi
+            if [ "$hm" -ge 823 ]; then slot="$(date -u +%F)-08"
+            elif [ "$hm" -ge 223 ]; then slot="$(date -u +%F)-02"
+            else slot="$(date -u -d yesterday +%F)-08"; fi
+            if [ "$slot" != "$last_daily" ]; then start daily.yml; last_daily=$slot; fi
+            sleep 60
+          done
+
+      - name: Start the next ticker
+        if: always()
+        run: |
+          if gh workflow run tick.yml -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then echo "next ticker started"; else echo "could not start the next ticker"; exit 1; fi

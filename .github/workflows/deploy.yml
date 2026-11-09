@@ -1,0 +1,142 @@
+name: ilmi deploy on merge
+
+# Cloudflare Pages is Direct Upload, so a merge to ilmi main deploys nothing by itself. Every 15 minutes this compares ilmi main with
+# the last commit deployed from here (branch "deployed" of this repository) and, when main moved, builds and uploads the frontend with
+# scripts/deploy-frontend-locally.sh, which also proves the live page is that build. A data commit of the daily run (author ilmi-bot)
+# is recorded and not built again: the daily run deployed it. Render deploys the API by itself and is not touched here.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Deploy even when main has not moved."
+        type: boolean
+        default: false
+
+concurrency:
+  group: ilmi-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write   # the "deployed" branch of THIS repository
+      actions: read     # is the daily run going?
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FORCE: ${{ inputs.force && 'true' || 'false' }}
+      CLOUDFLARE_ACCOUNT_ID: 869f5ac0f014c213dfb79e9a778bf3f3
+    steps:
+      - name: Has ilmi main moved?
+        id: check
+        env:
+          KEY: ${{ secrets.ILMI_DEPLOY_KEY }}
+        run: |
+          set -u
+          if [ -n "$(gh run list -R "$GITHUB_REPOSITORY" --workflow daily.yml --status in_progress --json databaseId --jq '.[].databaseId')" ]; then
+            echo "the daily run is going and deploys at its end; skipping"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          umask 077; printf '%s\n' "$KEY" > "$RUNNER_TEMP/k"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          want=$(git ls-remote git@github.com:ilmiOfficial/ilmi.git refs/heads/main | cut -f1)
+          rm -f "$RUNNER_TEMP/k"
+          have=$(gh api "repos/$GITHUB_REPOSITORY/contents/sha.txt?ref=deployed" --jq .content 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n' || true)
+          echo "ilmi main ${want:0:12}, last deployed ${have:0:12}"
+          echo "want=$want" >> "$GITHUB_OUTPUT"
+          if [ -z "$want" ]; then echo "main unreadable"; exit 1; fi
+          if [ "$want" = "$have" ] && [ "$FORCE" != true ]; then echo "go=false" >> "$GITHUB_OUTPUT"; else echo "go=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Check out ilmi main
+        if: steps.check.outputs.go == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, the tag as of 2026-11-07
+        with:
+          repository: ilmiOfficial/ilmi
+          ref: ${{ steps.check.outputs.want }}
+          ssh-key: ${{ secrets.ILMI_DEPLOY_KEY }}
+          fetch-depth: 1
+          path: ilmi
+
+      - name: Data commit of the daily run?
+        if: steps.check.outputs.go == 'true'
+        id: bot
+        working-directory: ilmi
+        run: |
+          if [ "$(git log -1 --format=%an)" = ilmi-bot ] && [ "$FORCE" != true ]; then
+            echo "author ilmi-bot: the daily run deployed this commit"; echo "skip=true" >> "$GITHUB_OUTPUT"
+          else echo "skip=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Set up uv (Python 3.12)
+        if: steps.check.outputs.go == 'true' && steps.bot.outputs.skip != 'true'
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5, the tag as of 2026-11-07
+        with:
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Set up Node
+        if: steps.check.outputs.go == 'true' && steps.bot.outputs.skip != 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4, the tag as of 2026-11-07
+        with:
+          node-version: "22"
+
+      - name: Build, upload, prove the live bundle
+        if: steps.check.outputs.go == 'true' && steps.bot.outputs.skip != 'true'
+        working-directory: ilmi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          VITE_POSTHOG_KEY: ${{ vars.VITE_POSTHOG_KEY }}
+          VITE_POSTHOG_HOST: ${{ vars.VITE_POSTHOG_HOST }}
+          VITE_POSTHOG_APP_URL: ${{ vars.VITE_POSTHOG_APP_URL }}
+          VITE_POSTHOG_DASHBOARD_ID: ${{ vars.VITE_POSTHOG_DASHBOARD_ID }}
+        run: |
+          # HEAD is the main commit read above; the script compares HEAD with DEPLOY_REF. Silent, as in daily.yml: output goes to a
+          # file that the next step keeps in the PRIVATE ilmi repository when the deploy fails.
+          set +e
+          DEPLOY_NO_FETCH=1 DEPLOY_REF=HEAD bash scripts/deploy-frontend-locally.sh > "$RUNNER_TEMP/deploy.log" 2>&1
+          rc=$?
+          echo "deploy exit code: $rc"
+          exit "$rc"
+
+      - name: Keep the deploy log in the private repository when it failed (branch daily-run-logs)
+        if: failure() && steps.check.outputs.go == 'true'
+        continue-on-error: true
+        working-directory: ilmi
+        run: |
+          [ -s "$RUNNER_TEMP/deploy.log" ] || exit 0
+          work="$RUNNER_TEMP/logs"; rm -rf "$work"; mkdir -p "$work"
+          if git fetch -q origin daily-run-logs 2>/dev/null; then git archive FETCH_HEAD | tar -x -C "$work"; fi
+          gzip -c "$RUNNER_TEMP/deploy.log" > "$work/$(date -u +%Y-%m-%dT%H%MZ)-deploy.log.gz"
+          ls -1 "$work" | sort | head -n -7 | while read -r f; do rm -f "$work/$f"; done
+          sshc=$(git config core.sshCommand)
+          git -C "$work" init -q -b daily-run-logs
+          git -C "$work" config user.name "ilmi-bot"; git -C "$work" config user.email "actions@github.com"
+          git -C "$work" config core.sshCommand "$sshc"
+          git -C "$work" add -A; git -C "$work" commit -qm "deploy log (run $GITHUB_RUN_ID)"
+          git -C "$work" push -q -f git@github.com:ilmiOfficial/ilmi.git daily-run-logs
+
+      - name: Record the deployed commit
+        if: steps.check.outputs.go == 'true'
+        run: |
+          d=$(mktemp -d); cd "$d"
+          git init -q -b deployed
+          git config user.name "ilmi-bot"; git config user.email "actions@github.com"
+          echo "${{ steps.check.outputs.want }}" > sha.txt
+          git add sha.txt; git commit -qm "deployed ${{ steps.check.outputs.want }}"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" deployed
+
+      - name: Tell the owner when the deploy failed
+        if: failure()
+        env:
+          TG_OPS_BOT_TOKEN: ${{ secrets.TG_OPS_BOT_TOKEN }}
+          TG_OPS_CHAT_ID: ${{ secrets.TG_OPS_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "${TG_OPS_BOT_TOKEN:-}" ] || exit 0
+          printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_OPS_BOT_TOKEN" \
+            | curl -s --max-time 20 -o /dev/null -K - \
+                --data-urlencode "chat_id=${TG_OPS_CHAT_ID}" \
+                --data-urlencode "text=ilmi deploy on merge FAILED: ${RUN_URL}" || true

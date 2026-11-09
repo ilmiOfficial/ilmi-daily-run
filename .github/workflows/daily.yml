@@ -1,0 +1,231 @@
+name: ilmi daily run
+
+# The daily data run of ilmi, on a GitHub runner, so it does not depend on the owner's computer.
+#
+# Why this repository is public: GitHub does not bill standard runners for a public repository, so this run costs no minutes of the
+# private ilmi repository, whose free quota ran out in August and again in October 2026 (issue 575 there). The repository holds only
+# this file and the README: no data, no secret value. The code is checked out from the private ilmi repository with a deploy key, and
+# the run is the same script a person starts by hand: scripts/run-pipeline-locally.sh.
+#
+# What a public log may show: step names, exit codes and dates. No pipeline output at all. The full log is kept in the PRIVATE ilmi
+# repository, branch daily-run-logs, newest 7 runs. Never add an artifact upload here: artifacts of a public repository are public.
+#
+# The source of this file is scripts/cloud/runner-repo/ in ilmiOfficial/ilmi; scripts/cloud/setup-runner.sh publishes it.
+
+on:
+  schedule:
+    - cron: "23 2 * * *"   # the daily run
+    - cron: "23 8 * * *"   # a second chance: GitHub drops and delays scheduled runs; this one skips when the site is current
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full: scrape and deploy. no-scrape: rebuild and deploy what main holds. probe: check the runner and change nothing."
+        type: choice
+        options: [full, no-scrape, probe]
+        default: full
+      force:
+        description: "Run even when the live site already serves today's data."
+        type: boolean
+        default: false
+
+# One run at a time. A queued second firing waits, then finds the site current and stops.
+concurrency:
+  group: ilmi-daily-run
+  cancel-in-progress: false
+
+jobs:
+  run:
+    # Only the main branch of this repository may start a run, because the data commit goes to ilmi main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    # The hard limit of a GitHub-hosted job is 360 minutes. The pipeline took 79 minutes of data steps on 2026-11-06 and about 110
+    # minutes in total on a Mac.
+    timeout-minutes: 345
+    permissions:
+      contents: write   # only for the keepalive branch of THIS repository
+    defaults:
+      run:
+        shell: bash
+        working-directory: ilmi
+    env:
+      TZ: UTC
+      MODE: ${{ inputs.mode || 'full' }}
+      FORCE: ${{ inputs.force && 'true' || 'false' }}
+      PIPELINE_WHERE: cloud
+      PIPELINE_SKIP_BACKUP: "1"
+      CLOUDFLARE_ACCOUNT_ID: 869f5ac0f014c213dfb79e9a778bf3f3
+      VITE_POSTHOG_KEY: ${{ vars.VITE_POSTHOG_KEY }}
+      VITE_POSTHOG_HOST: ${{ vars.VITE_POSTHOG_HOST }}
+      VITE_POSTHOG_APP_URL: ${{ vars.VITE_POSTHOG_APP_URL }}
+      VITE_POSTHOG_DASHBOARD_ID: ${{ vars.VITE_POSTHOG_DASHBOARD_ID }}
+    # No secret is set here on purpose: a job level env reaches every step, third party actions included. Each secret is given to the
+    # one step that needs it (the .env writer and the failure notice); the pipeline reads the .env file, as it does on the owner's Mac.
+    # The actions are pinned to a commit, not a tag, because a moved tag would run new code with the repository's secrets.
+
+    steps:
+      - name: Check out ilmi (private) with the deploy key
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, the tag as of 2026-11-07
+        with:
+          repository: ilmiOfficial/ilmi
+          ref: main
+          ssh-key: ${{ secrets.ILMI_DEPLOY_KEY }}
+          fetch-depth: 0
+          path: ilmi
+
+      - name: Set up uv (Python 3.12)
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5, the tag as of 2026-11-07
+        with:
+          python-version: "3.12"
+          # No cache: a cache of a public repository is shared state, and the probe run failed in the cache save (path absent).
+          enable-cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4, the tag as of 2026-11-07
+        with:
+          node-version: "22"
+
+      - name: Is the live site already current?
+        id: live
+        run: |
+          set +e
+          bash scripts/live-is-current.sh
+          rc=$?
+          if [ "$MODE" = full ] && [ "$FORCE" != true ] && [ "$rc" = 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Nothing to do: the live site already serves today's data."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Git identity (the one the old scrape workflow used)
+        if: steps.live.outputs.skip != 'true'
+        run: |
+          git config user.name "ilmi-bot"
+          git config user.email "actions@github.com"
+
+      # Some scripts read the file .env and not the environment (atlas-deploy-locally.sh). The file lives on this runner's disk
+      # only, is git-ignored, and goes with the machine when the job ends.
+      - name: Write .env from the secrets (runner disk only)
+        if: steps.live.outputs.skip != 'true'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          USAJOBS_API_KEY: ${{ secrets.USAJOBS_API_KEY }}
+          USAJOBS_EMAIL: ${{ secrets.USAJOBS_EMAIL }}
+          REED_API_KEY: ${{ secrets.REED_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN_ATLAS: ${{ secrets.CLOUDFLARE_API_TOKEN_ATLAS }}
+          TG_OPS_BOT_TOKEN: ${{ secrets.TG_OPS_BOT_TOKEN }}
+          TG_OPS_CHAT_ID: ${{ secrets.TG_OPS_CHAT_ID }}
+          VAPID_PUBLIC_KEY: ${{ secrets.VAPID_PUBLIC_KEY }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          VAPID_SUBJECT: ${{ secrets.VAPID_SUBJECT }}
+        run: |
+          umask 077
+          : > .env
+          for n in DATABASE_URL GEMINI_API_KEY ADZUNA_APP_ID ADZUNA_APP_KEY USAJOBS_API_KEY USAJOBS_EMAIL REED_API_KEY \
+                   CLOUDFLARE_API_TOKEN CLOUDFLARE_API_TOKEN_ATLAS CLOUDFLARE_ACCOUNT_ID TG_OPS_BOT_TOKEN TG_OPS_CHAT_ID \
+                   VAPID_PUBLIC_KEY VAPID_PRIVATE_KEY VAPID_SUBJECT \
+                   VITE_POSTHOG_KEY VITE_POSTHOG_HOST VITE_POSTHOG_APP_URL VITE_POSTHOG_DASHBOARD_ID; do
+            v="${!n:-}"
+            if [ -n "$v" ]; then printf '%s=%s\n' "$n" "$v" >> .env; else echo "not set: $n"; fi
+          done
+          echo ".env has $(wc -l < .env | tr -d ' ') keys"
+
+      - name: Probe (mode probe changes nothing and reports what is missing)
+        if: steps.live.outputs.skip != 'true' && env.MODE == 'probe'
+        run: |
+          set +e
+          LOG="$RUNNER_TEMP/pipeline.log"
+          {
+            echo "probe at $(date -u +%FT%TZ)"
+            echo "uv $(uv --version), node $(node --version), python3 $(python3 --version)"
+            git log -1 --format='ilmi main is at %h, committed %cs'
+            git config core.sshCommand > /dev/null && echo "deploy key: configured for git"
+            git ls-remote --heads origin main | cut -c1-12
+            echo "the steps a full run would take:"
+            PIPELINE_DRY=1 bash scripts/run-pipeline-locally.sh --dry-run | grep -E '^ *[0-9]+\. \['
+          } > "$LOG" 2>&1
+          echo "probe written to the private log ($(wc -l < "$LOG" | tr -d ' ') lines)"
+
+      - name: Run the daily pipeline
+        id: pipeline
+        if: steps.live.outputs.skip != 'true' && env.MODE != 'probe'
+        run: |
+          set +e
+          LOG="$RUNNER_TEMP/pipeline.log"
+          args=""
+          [ "$MODE" = no-scrape ] && args="--no-scrape"
+          # Silent by design (owner 2026-11-09): not one line of pipeline output reaches this public log. GitHub masks a secret's
+          # exact value, not a piece of it (the password inside DATABASE_URL), so a printed line is the leak path. Everything goes
+          # to the file, which the next step keeps in the PRIVATE ilmi repository only.
+          bash scripts/run-pipeline-locally.sh $args > "$LOG" 2>&1
+          rc=$?
+          echo "pipeline exit code: $rc"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Keep the full log in the private repository (branch daily-run-logs, newest 7)
+        if: always() && steps.live.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          LOG="$RUNNER_TEMP/pipeline.log"
+          [ -s "$LOG" ] || { echo "no log to keep"; exit 0; }
+          work="$RUNNER_TEMP/logs"
+          rm -rf "$work"; mkdir -p "$work"
+          sshc=$(git config core.sshCommand)
+          if git fetch -q origin daily-run-logs 2>/dev/null; then git archive FETCH_HEAD | tar -x -C "$work"; fi
+          gzip -c "$LOG" > "$work/$(date -u +%Y-%m-%dT%H%MZ)-$MODE.log.gz"
+          ls -1 "$work" | sort | head -n -7 | while read -r f; do rm -f "$work/$f"; done
+          git -C "$work" init -q -b daily-run-logs
+          git -C "$work" config user.name "ilmi-bot"
+          git -C "$work" config user.email "actions@github.com"
+          git -C "$work" config core.sshCommand "$sshc"
+          git -C "$work" add -A
+          git -C "$work" commit -qm "daily run logs, newest 7 (run $GITHUB_RUN_ID)"
+          git -C "$work" push -q -f git@github.com:ilmiOfficial/ilmi.git daily-run-logs
+          echo "full log kept: ilmi branch daily-run-logs"
+
+      # The three steps below run even when the checkout failed, so they start from the workspace, not from the ilmi folder.
+      - name: Summary
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: |
+          {
+            echo "### ilmi daily run"
+            echo "mode: $MODE, forced: $FORCE, skipped (site already current): ${{ steps.live.outputs.skip || 'n/a' }}"
+            echo "pipeline exit code: ${{ steps.pipeline.outputs.rc || 'not run' }}"
+            if [ -f ilmi/scripts/live-is-current.sh ]; then echo "site now: $(bash ilmi/scripts/live-is-current.sh || true)"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tell the owner when the run failed
+        if: failure()
+        working-directory: ${{ github.workspace }}
+        env:
+          TG_OPS_BOT_TOKEN: ${{ secrets.TG_OPS_BOT_TOKEN }}
+          TG_OPS_CHAT_ID: ${{ secrets.TG_OPS_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "${TG_OPS_BOT_TOKEN:-}" ] || { echo "no Telegram secrets, nothing sent"; exit 0; }
+          printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_OPS_BOT_TOKEN" \
+            | curl -s --max-time 20 -o /dev/null -K - \
+                --data-urlencode "chat_id=${TG_OPS_CHAT_ID}" \
+                --data-urlencode "text=ilmi cloud daily run FAILED: ${RUN_URL}" || true
+
+      # GitHub switches scheduled workflows off in a public repository after 60 days without activity. A push on every run,
+      # skipped runs included, is the activity. Whether GitHub counts a push made with the workflow token is not proven yet.
+      - name: Keepalive for the 60 day rule
+        if: always()
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          d=$(mktemp -d); cd "$d"
+          git init -q -b heartbeat
+          git config user.name "ilmi-bot"; git config user.email "actions@github.com"
+          echo "last run: $(date -u +%FT%TZ), mode $MODE, run $GITHUB_RUN_ID" > last-run.txt
+          git add last-run.txt
+          git commit -qm "last run"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" heartbeat

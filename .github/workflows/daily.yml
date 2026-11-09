@@ -142,7 +142,7 @@ jobs:
           set +e
           LOG="$RUNNER_TEMP/pipeline.log"
           {
-            echo "probe at $(date -u +%FT%TZ)"
+            echo "probe at $(TZ=Asia/Bishkek date '+%F %H:%M') Bishkek"
             echo "uv $(uv --version), node $(node --version), python3 $(python3 --version)"
             git log -1 --format='ilmi main is at %h, committed %cs'
             git config core.sshCommand > /dev/null && echo "deploy key: configured for git"
@@ -227,7 +227,7 @@ jobs:
           d=$(mktemp -d); cd "$d"
           git init -q -b heartbeat
           git config user.name "ilmi-bot"; git config user.email "actions@github.com"
-          echo "last run: $(date -u +%FT%TZ), mode $MODE, run $GITHUB_RUN_ID" > last-run.txt
+          echo "last run: $(TZ=Asia/Bishkek date '+%F %H:%M') Bishkek, mode $MODE, run $GITHUB_RUN_ID" > last-run.txt
           git add last-run.txt
           git commit -qm "last run"
           git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" heartbeat

@@ -119,6 +119,8 @@ jobs:
           CLOUDFLARE_API_TOKEN_ATLAS: ${{ secrets.CLOUDFLARE_API_TOKEN_ATLAS }}
           TG_OPS_BOT_TOKEN: ${{ secrets.TG_OPS_BOT_TOKEN }}
           TG_OPS_CHAT_ID: ${{ secrets.TG_OPS_CHAT_ID }}
+          TG_ILMI_BOT_TOKEN: ${{ secrets.TG_ILMI_BOT_TOKEN }}
+          TG_ILMI_CHAT_ID: ${{ secrets.TG_ILMI_CHAT_ID }}
           VAPID_PUBLIC_KEY: ${{ secrets.VAPID_PUBLIC_KEY }}
           VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
           VAPID_SUBJECT: ${{ secrets.VAPID_SUBJECT }}
@@ -127,7 +129,7 @@ jobs:
           : > .env
           for n in DATABASE_URL GEMINI_API_KEY ADZUNA_APP_ID ADZUNA_APP_KEY USAJOBS_API_KEY USAJOBS_EMAIL REED_API_KEY \
                    CLOUDFLARE_API_TOKEN CLOUDFLARE_API_TOKEN_ATLAS CLOUDFLARE_ACCOUNT_ID TG_OPS_BOT_TOKEN TG_OPS_CHAT_ID \
-                   VAPID_PUBLIC_KEY VAPID_PRIVATE_KEY VAPID_SUBJECT \
+                   TG_ILMI_BOT_TOKEN TG_ILMI_CHAT_ID VAPID_PUBLIC_KEY VAPID_PRIVATE_KEY VAPID_SUBJECT \
                    VITE_POSTHOG_KEY VITE_POSTHOG_HOST VITE_POSTHOG_APP_URL VITE_POSTHOG_DASHBOARD_ID; do
             v="${!n:-}"
             if [ -n "$v" ]; then printf '%s=%s\n' "$n" "$v" >> .env; else echo "not set: $n"; fi

@@ -19,9 +19,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "full: scrape and deploy. no-scrape: rebuild and deploy what main holds. probe: check the runner and change nothing."
+        description: "full: scrape and deploy. no-scrape: rebuild and deploy what main holds. probe: check the runner and change nothing. backup: only the encrypted backup to the private branch db-backups."
         type: choice
-        options: [full, no-scrape, probe]
+        options: [full, no-scrape, probe, backup]
         default: full
       force:
         description: "Run even when the live site already serves today's data."
@@ -123,17 +123,44 @@ jobs:
           VAPID_PUBLIC_KEY: ${{ secrets.VAPID_PUBLIC_KEY }}
           VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
           VAPID_SUBJECT: ${{ secrets.VAPID_SUBJECT }}
+          BACKUP_AGE_RECIPIENT: ${{ secrets.BACKUP_AGE_RECIPIENT }}
+          STARTUPJOBS_CZ_FEED_URL: ${{ secrets.STARTUPJOBS_CZ_FEED_URL }}
         run: |
           umask 077
           : > .env
           for n in DATABASE_URL GEMINI_API_KEY ADZUNA_APP_ID ADZUNA_APP_KEY USAJOBS_API_KEY USAJOBS_EMAIL REED_API_KEY \
                    CLOUDFLARE_API_TOKEN CLOUDFLARE_API_TOKEN_ATLAS CLOUDFLARE_ACCOUNT_ID TG_OPS_BOT_TOKEN TG_OPS_CHAT_ID \
-                   TG_ALERTS_BOT_TOKEN VAPID_PUBLIC_KEY VAPID_PRIVATE_KEY VAPID_SUBJECT \
+                   TG_ALERTS_BOT_TOKEN VAPID_PUBLIC_KEY VAPID_PRIVATE_KEY VAPID_SUBJECT BACKUP_AGE_RECIPIENT STARTUPJOBS_CZ_FEED_URL \
                    VITE_POSTHOG_KEY VITE_POSTHOG_HOST VITE_POSTHOG_APP_URL VITE_POSTHOG_DASHBOARD_ID; do
             v="${!n:-}"
             if [ -n "$v" ]; then printf '%s=%s\n' "$n" "$v" >> .env; else echo "not set: $n"; fi
           done
           echo ".env has $(wc -l < .env | tr -d ' ') keys"
+
+      # The tables that cannot be rebuilt are dumped, encrypted with age to the owner's PUBLIC key and pushed to the private branch
+      # db-backups of ilmi (scripts/backup-cloud.sh, #806). Neon runs Postgres 17 and pg_dump refuses a newer server, so the
+      # client 17 comes from the PostgreSQL apt repository; the runner image ships 16.
+      - name: Tools for the encrypted backup (pg_dump 17, age)
+        if: steps.live.outputs.skip != 'true' && env.MODE != 'probe'
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update -qq > /dev/null
+          sudo apt-get install -y -qq postgresql-client-17 age > /dev/null
+          /usr/lib/postgresql/17/bin/pg_dump --version
+
+      - name: Encrypted backup only (mode backup)
+        id: backuponly
+        if: steps.live.outputs.skip != 'true' && env.MODE == 'backup'
+        run: |
+          set +e
+          LOG="$RUNNER_TEMP/pipeline.log"
+          # Same rule as the pipeline: the public log shows the exit code only, the lines go to the private log branch.
+          bash scripts/backup-cloud.sh > "$LOG" 2>&1
+          rc=$?
+          echo "backup exit code: $rc"
+          exit "$rc"
 
       - name: Probe (mode probe changes nothing and reports what is missing)
         if: steps.live.outputs.skip != 'true' && env.MODE == 'probe'
@@ -153,7 +180,7 @@ jobs:
 
       - name: Run the daily pipeline
         id: pipeline
-        if: steps.live.outputs.skip != 'true' && env.MODE != 'probe'
+        if: steps.live.outputs.skip != 'true' && env.MODE != 'probe' && env.MODE != 'backup'
         run: |
           set +e
           LOG="$RUNNER_TEMP/pipeline.log"
